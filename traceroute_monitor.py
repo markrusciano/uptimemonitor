@@ -8,6 +8,13 @@ import signal
 import sys
 from datetime import datetime, timedelta
 
+# Additional imports for plotting
+import matplotlib
+matplotlib.use('Agg')  # Use a non-interactive backend
+import matplotlib.pyplot as plt
+import base64
+from io import BytesIO
+
 # Set up logging configuration
 logging.basicConfig(
     level=logging.DEBUG,  # Set to logging.INFO to reduce verbosity
@@ -63,7 +70,11 @@ def run_traceroute(ip_address, connection_name, interface, verbose=False):
                 loss_str = columns[2]
                 try:
                     loss_value = float(loss_str.strip('%'))
-                    packet_loss.append(loss_value)
+                    # Ensure packet loss is within 0% to 100%
+                    if 0 <= loss_value <= 100:
+                        packet_loss.append(loss_value)
+                    else:
+                        logging.warning(f"Ignoring out-of-range packet loss value: {loss_value}% in line: {line}")
                 except ValueError:
                     logging.warning(f"Could not parse loss value '{loss_str}' in line: {line}")
             else:
@@ -133,7 +144,65 @@ def get_average_packet_loss(time_window, connection_name):
         logging.exception(f"Error calculating average packet loss: {e}")
         return 0
 
-# Function to generate HTML content with packet loss averages
+# Function to generate packet loss graph for a connection
+def generate_packet_loss_graph(connection_name):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        one_week_ago = int(time.time()) - (60 * 60 * 24 * 7)  # 1 week ago in UNIX timestamp
+        cursor.execute("""
+            SELECT timestamp, packet_loss FROM traceroute_results
+            WHERE timestamp >= ? AND connection_name = ?
+            ORDER BY timestamp ASC
+        """, (one_week_ago, connection_name))
+        data = cursor.fetchall()
+        conn.close()
+
+        if not data:
+            logging.info(f"No data available for graph generation for {connection_name}")
+            return None
+
+        timestamps, packet_losses = zip(*data)
+        # Filter out negative packet loss values and values above 100%
+        times = []
+        losses = []
+        for ts, pl in zip(timestamps, packet_losses):
+            if 0 <= pl <= 100:
+                times.append(datetime.fromtimestamp(ts))
+                losses.append(pl)
+            else:
+                logging.warning(f"Ignoring out-of-range packet loss value: {pl}% at timestamp {ts}")
+
+        if not times:
+            logging.info(f"No valid data points to plot for {connection_name}")
+            return None
+
+        # Plot the data
+        plt.figure(figsize=(10, 5))
+        plt.plot(times, losses, marker='o', linestyle='-', label=connection_name)
+        plt.xlabel('Time')
+        plt.ylabel('Packet Loss (%)')
+        plt.title(f'Packet Loss Over Time for {connection_name}')
+        plt.legend()
+        plt.grid(True)
+        plt.ylim(0, 100)  # Set Y-axis range from 0% to 100%
+        plt.tight_layout()
+
+        # Save the plot to a BytesIO object
+        img_buffer = BytesIO()
+        plt.savefig(img_buffer, format='png')
+        plt.close()
+        img_buffer.seek(0)
+        # Encode the image to base64
+        img_base64 = base64.b64encode(img_buffer.getvalue()).decode('utf-8')
+
+        return img_base64
+
+    except Exception as e:
+        logging.exception(f"Failed to generate packet loss graph for {connection_name}: {e}")
+        return None
+
+# Function to generate HTML content with packet loss averages and graphs
 def generate_html(connection_names):
     try:
         html_content = f"""
@@ -144,10 +213,11 @@ def generate_html(connection_names):
                 table {{ width: 100%; border-collapse: collapse; }}
                 th, td {{ border: 1px solid black; padding: 8px; text-align: center; }}
                 th {{ background-color: #f2f2f2; }}
+                img {{ max-width: 100%; height: auto; }}
             </style>
         </head>
         <body>
-            <h1>Packet Loss Averages</h1>
+            <h1>Packet Loss Averages and Graphs</h1>
         """
 
         for connection_name in connection_names:
@@ -158,6 +228,13 @@ def generate_html(connection_names):
                 "last_day": get_average_packet_loss(60 * 24, connection_name),
                 "last_week": get_average_packet_loss(60 * 24 * 7, connection_name)
             }
+
+            # Generate packet loss graph
+            img_base64 = generate_packet_loss_graph(connection_name)
+            if img_base64:
+                img_tag = f'<img src="data:image/png;base64,{img_base64}" alt="Packet Loss Graph for {connection_name}">'
+            else:
+                img_tag = '<p>No data available to generate graph.</p>'
 
             html_content += f"""
             <h2>{connection_name}</h2>
@@ -187,6 +264,8 @@ def generate_html(connection_names):
                     <td>{averages['last_week']:.2f}</td>
                 </tr>
             </table>
+            <h3>Packet Loss Over Time</h3>
+            {img_tag}
             """
 
         # Add the legal disclaimer at the bottom
