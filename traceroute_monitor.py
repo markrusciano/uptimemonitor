@@ -56,6 +56,10 @@ def run_traceroute(ip_address, connection_name, interface, verbose=False):
         for line in lines[1:]:  # Skip the first hop
             columns = line.split()
             if len(columns) >= 3:
+                hostname = columns[1]
+                if hostname == '???':
+                    logging.debug(f"Skipping line with '???' hostname: {line}")
+                    continue  # Skip this line
                 loss_str = columns[2]
                 try:
                     loss_value = float(loss_str.strip('%'))
@@ -74,10 +78,6 @@ def run_traceroute(ip_address, connection_name, interface, verbose=False):
             logging.warning(f"No valid packet loss data found for {interface}")
         
         return avg_loss, output  # Return both average loss and full output
-
-    except Exception as e:
-        logging.exception(f"Exception occurred during traceroute: {e}")
-        return None, None
 
     except Exception as e:
         logging.exception(f"Exception occurred during traceroute: {e}")
@@ -192,9 +192,7 @@ def generate_html(connection_names):
         # Add the legal disclaimer at the bottom
         html_content += """
             <p><em>
-            Disclaimer: This site, <strong>zentrostatus.com</strong>, is an independent, third-party resource created to track internet connectivity and packet loss statistics for personal and educational purposes. It is not affiliated with or endorsed by <strong>Zentro</strong> or any related company. All data provided on this site is collected through public and legal methods, and the results displayed are intended solely for informational purposes. This site does not claim to represent the official status or performance of Zentro's services.
-
-            If you are a representative of Zentro and have any concerns or inquiries about the content, please contact us at [Your Contact Email], and we will promptly address your request.
+            Disclaimer: This site, <strong>zentrostatus.com</strong>, is an independent, third-party resource created to track internet connectivity and packet loss statistics for personal and educational purposes. It is not affiliated with or endorsed by <strong>Zentro</strong> or any related company. All data provided on this site is collected through public and legal methods, and the results displayed are intended solely for informational purposes. Results are isolated to one point in the network and are not representative of network performance as a whole. This site does not claim to represent the official status or performance of Zentro's services.
             </em></p>
         </body>
         </html>
