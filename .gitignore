@@ -164,3 +164,4 @@ cython_debug/
 traceroute.db
 traceroute_monitor.log
 .DS_store
+cron.log
