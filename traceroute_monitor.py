@@ -1,5 +1,4 @@
 import subprocess
-import re
 import sqlite3
 import time
 import argparse
@@ -111,26 +110,57 @@ def save_to_db(connection_name, target_ip, packet_loss):
     except Exception as e:
         logging.exception(f"Error saving data to database: {e}")
 
-# Function to retrieve packet loss data for a connection
-def get_packet_loss_data(connection_name):
+# Function to retrieve packet loss data for all connections merged by timestamp
+def get_combined_packet_loss_data(connection_names):
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         one_week_ago = int(time.time()) - (60 * 60 * 24 * 7)  # 1 week ago in UNIX timestamp
-        cursor.execute("""
-            SELECT timestamp, packet_loss FROM traceroute_results
-            WHERE timestamp >= ? AND connection_name = ?
-            ORDER BY timestamp ASC
-        """, (one_week_ago, connection_name))
-        data = cursor.fetchall()
+
+        # Retrieve data for all connections
+        data = {}
+        for connection_name in connection_names:
+            cursor.execute("""
+                SELECT timestamp, packet_loss FROM traceroute_results
+                WHERE timestamp >= ? AND connection_name = ?
+                ORDER BY timestamp ASC
+            """, (one_week_ago, connection_name))
+            data[connection_name] = cursor.fetchall()
+
         conn.close()
-        return data
+
+        # Merge data by timestamp
+        combined_data = {}
+        for connection_name in connection_names:
+            for timestamp, packet_loss in data[connection_name]:
+                if 0 <= packet_loss <= 100:
+                    if timestamp not in combined_data:
+                        combined_data[timestamp] = {}
+                    combined_data[timestamp][connection_name] = packet_loss
+                else:
+                    logging.warning(f"Ignoring out-of-range packet loss value: {packet_loss}% at timestamp {timestamp}")
+
+        # Convert combined data to sorted lists
+        sorted_timestamps = sorted(combined_data.keys())
+        times = [datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S') for ts in sorted_timestamps]
+        isp1_losses = []
+        isp2_losses = []
+
+        isp1_name = connection_names[0]
+        isp2_name = connection_names[1]
+
+        for ts in sorted_timestamps:
+            isp1_losses.append(combined_data[ts].get(isp1_name, None))
+            isp2_losses.append(combined_data[ts].get(isp2_name, None))
+
+        return times, isp1_losses, isp2_losses
+
     except sqlite3.Error as e:
         logging.error(f"Database error: {e}")
-        return []
+        return [], [], []
     except Exception as e:
-        logging.exception(f"Error retrieving data from database: {e}")
-        return []
+        logging.exception(f"Error retrieving combined data from database: {e}")
+        return [], [], []
 
 # Function to calculate average packet loss for a specific time window
 def get_average_packet_loss(time_window, connection_name):
@@ -159,25 +189,11 @@ def get_average_packet_loss(time_window, connection_name):
         logging.exception(f"Error calculating average packet loss: {e}")
         return 0
 
-# Function to generate HTML content with packet loss averages and graphs
+# Function to generate HTML content with combined packet loss data and graph
 def generate_html(connection_names):
     try:
-        # Collect data for all connections
-        connection_data = {}
-        for connection_name in connection_names:
-            data = get_packet_loss_data(connection_name)
-            if data:
-                timestamps, packet_losses = zip(*data)
-                # Filter out invalid packet loss values
-                times = []
-                losses = []
-                for ts, pl in zip(timestamps, packet_losses):
-                    if 0 <= pl <= 100:
-                        times.append(datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S'))
-                        losses.append(pl)
-                connection_data[connection_name] = {'times': times, 'losses': losses}
-            else:
-                connection_data[connection_name] = {'times': [], 'losses': []}
+        # Get combined data
+        times, isp1_losses, isp2_losses = get_combined_packet_loss_data(connection_names)
 
         # Prepare averages for each connection
         averages_data = {}
@@ -190,6 +206,13 @@ def generate_html(connection_names):
                 "last_week": get_average_packet_loss(60 * 24 * 7, connection_name)
             }
             averages_data[connection_name] = averages
+
+        # JSON encode the data for JavaScript
+        times_json = json.dumps(times)
+        isp1_losses_json = json.dumps(isp1_losses)
+        isp2_losses_json = json.dumps(isp2_losses)
+        isp1_name = connection_names[0]
+        isp2_name = connection_names[1]
 
         # Prepare the HTML content
         html_content = f"""
@@ -217,116 +240,127 @@ def generate_html(connection_names):
                 }}
                 .chart-container {{
                     position: relative;
-                    height: 400px;
+                    height: 500px;
                 }}
             </style>
         </head>
         <body>
             <div class="container">
                 <h1 class="text-center">Packet Loss Monitoring</h1>
-        """
-
-        # Add content for each connection
-        for connection_name in connection_names:
-            averages = averages_data[connection_name]
-            times = connection_data[connection_name]['times']
-            losses = connection_data[connection_name]['losses']
-
-            # JSON encode the data for JavaScript
-            times_json = json.dumps(times)
-            losses_json = json.dumps(losses)
-
-            html_content += f"""
-            <div class="card">
-                <div class="card-header">
-                    <h2>{connection_name}</h2>
-                </div>
-                <div class="card-body">
-                    <div class="row">
-                        <div class="col-md-6">
-                            <h3>Average Packet Loss</h3>
-                            <table class="table table-striped">
-                                <thead>
-                                    <tr>
-                                        <th>Time Period</th>
-                                        <th>Average Packet Loss (%)</th>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    <tr>
-                                        <td>Last 15 minutes</td>
-                                        <td>{averages['last_15_min']:.2f}</td>
-                                    </tr>
-                                    <tr>
-                                        <td>Last 30 minutes</td>
-                                        <td>{averages['last_30_min']:.2f}</td>
-                                    </tr>
-                                    <tr>
-                                        <td>Last hour</td>
-                                        <td>{averages['last_hour']:.2f}</td>
-                                    </tr>
-                                    <tr>
-                                        <td>Last day</td>
-                                        <td>{averages['last_day']:.2f}</td>
-                                    </tr>
-                                    <tr>
-                                        <td>Last week</td>
-                                        <td>{averages['last_week']:.2f}</td>
-                                    </tr>
-                                </tbody>
-                            </table>
-                        </div>
-                        <div class="col-md-6">
-                            <h3>Packet Loss Over Time</h3>
-                            <div class="chart-container">
-                                <canvas id="chart_{connection_name}"></canvas>
-                            </div>
+                <div class="card">
+                    <div class="card-header">
+                        <h2>Packet Loss Comparison</h2>
+                    </div>
+                    <div class="card-body">
+                        <h3>Average Packet Loss</h3>
+                        <table class="table table-striped">
+                            <thead>
+                                <tr>
+                                    <th>Time Period</th>
+                                    <th>{isp1_name} Packet Loss (%)</th>
+                                    <th>{isp2_name} Packet Loss (%)</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <td>Last 15 minutes</td>
+                                    <td>{averages_data[isp1_name]['last_15_min']:.2f}</td>
+                                    <td>{averages_data[isp2_name]['last_15_min']:.2f}</td>
+                                </tr>
+                                <tr>
+                                    <td>Last 30 minutes</td>
+                                    <td>{averages_data[isp1_name]['last_30_min']:.2f}</td>
+                                    <td>{averages_data[isp2_name]['last_30_min']:.2f}</td>
+                                </tr>
+                                <tr>
+                                    <td>Last hour</td>
+                                    <td>{averages_data[isp1_name]['last_hour']:.2f}</td>
+                                    <td>{averages_data[isp2_name]['last_hour']:.2f}</td>
+                                </tr>
+                                <tr>
+                                    <td>Last day</td>
+                                    <td>{averages_data[isp1_name]['last_day']:.2f}</td>
+                                    <td>{averages_data[isp2_name]['last_day']:.2f}</td>
+                                </tr>
+                                <tr>
+                                    <td>Last week</td>
+                                    <td>{averages_data[isp1_name]['last_week']:.2f}</td>
+                                    <td>{averages_data[isp2_name]['last_week']:.2f}</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                        <h3>Packet Loss Over Time</h3>
+                        <div class="chart-container">
+                            <canvas id="packetLossChart"></canvas>
                         </div>
                     </div>
                 </div>
-            </div>
-            <!-- JavaScript to render the chart -->
-            <script>
-                const ctx_{connection_name} = document.getElementById('chart_{connection_name}').getContext('2d');
-                const chart_{connection_name} = new Chart(ctx_{connection_name}, {{
-                    type: 'line',
-                    data: {{
-                        labels: {times_json},
-                        datasets: [{{
-                            label: '{connection_name} Packet Loss (%)',
-                            data: {losses_json},
-                            borderColor: 'rgba(75, 192, 192, 1)',
-                            backgroundColor: 'rgba(75, 192, 192, 0.2)',
-                            fill: true,
-                            tension: 0.1,
-                        }}]
-                    }},
-                    options: {{
-                        responsive: true,
-                        scales: {{
-                            y: {{
-                                beginAtZero: true,
-                                max: 100,
-                                title: {{
+                <!-- JavaScript to render the chart -->
+                <script>
+                    const ctx = document.getElementById('packetLossChart').getContext('2d');
+                    const packetLossChart = new Chart(ctx, {{
+                        type: 'line',
+                        data: {{
+                            labels: {times_json},
+                            datasets: [
+                                {{
+                                    label: '{isp1_name} Packet Loss (%)',
+                                    data: {isp1_losses_json},
+                                    borderColor: 'orange',
+                                    backgroundColor: 'rgba(255, 165, 0, 0.2)',
+                                    fill: false,
+                                    tension: 0.1,
+                                }},
+                                {{
+                                    label: '{isp2_name} Packet Loss (%)',
+                                    data: {isp2_losses_json},
+                                    borderColor: 'red',
+                                    backgroundColor: 'rgba(255, 0, 0, 0.2)',
+                                    fill: false,
+                                    tension: 0.1,
+                                }}
+                            ]
+                        }},
+                        options: {{
+                            responsive: true,
+                            scales: {{
+                                y: {{
+                                    beginAtZero: true,
+                                    max: 100,
+                                    title: {{
+                                        display: true,
+                                        text: 'Packet Loss (%)'
+                                    }}
+                                }},
+                                x: {{
                                     display: true,
-                                    text: 'Packet Loss (%)'
+                                    title: {{
+                                        display: true,
+                                        text: 'Time'
+                                    }},
+                                    ticks: {{
+                                        maxTicksLimit: 10,
+                                        autoSkip: true
+                                    }}
                                 }}
                             }},
-                            x: {{
-                                display: true,
-                                title: {{
+                            interaction: {{
+                                mode: 'index',
+                                intersect: false,
+                            }},
+                            plugins: {{
+                                tooltip: {{
+                                    mode: 'index',
+                                    intersect: false,
+                                }},
+                                legend: {{
                                     display: true,
-                                    text: 'Time'
+                                    position: 'top',
                                 }}
                             }}
                         }}
-                    }}
-                }});
-            </script>
-            """
-
-        # Add the legal disclaimer at the bottom
-        html_content += """
+                    }});
+                </script>
                 <p class="text-muted"><em>
                 Disclaimer: This site, <strong>zentrostatus.com</strong>, is an independent, third-party resource created to track internet connectivity and packet loss statistics for personal and educational purposes. It is not affiliated with or endorsed by <strong>Zentro</strong> or any related company. All data provided on this site is collected through public and legal methods, and the results displayed are intended solely for informational purposes. Results are isolated to one point in the network and are not representative of network performance as a whole. This site does not claim to represent the official status or performance of Zentro's services.
                 </em></p>
