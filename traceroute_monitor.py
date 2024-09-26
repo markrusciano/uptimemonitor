@@ -7,17 +7,11 @@ import logging
 import signal
 import sys
 from datetime import datetime, timedelta
-
-# Additional imports for plotting
-import matplotlib
-matplotlib.use('Agg')  # Use a non-interactive backend
-import matplotlib.pyplot as plt
-import base64
-from io import BytesIO
+import json  # For data serialization
 
 # Set up logging configuration
 logging.basicConfig(
-    level=logging.DEBUG,  # Set to logging.INFO to reduce verbosity
+    level=logging.INFO,  # Set to logging.DEBUG for more verbosity
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler("traceroute_monitor.log"),  # Log to a file
@@ -117,6 +111,27 @@ def save_to_db(connection_name, target_ip, packet_loss):
     except Exception as e:
         logging.exception(f"Error saving data to database: {e}")
 
+# Function to retrieve packet loss data for a connection
+def get_packet_loss_data(connection_name):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        one_week_ago = int(time.time()) - (60 * 60 * 24 * 7)  # 1 week ago in UNIX timestamp
+        cursor.execute("""
+            SELECT timestamp, packet_loss FROM traceroute_results
+            WHERE timestamp >= ? AND connection_name = ?
+            ORDER BY timestamp ASC
+        """, (one_week_ago, connection_name))
+        data = cursor.fetchall()
+        conn.close()
+        return data
+    except sqlite3.Error as e:
+        logging.error(f"Database error: {e}")
+        return []
+    except Exception as e:
+        logging.exception(f"Error retrieving data from database: {e}")
+        return []
+
 # Function to calculate average packet loss for a specific time window
 def get_average_packet_loss(time_window, connection_name):
     try:
@@ -144,82 +159,28 @@ def get_average_packet_loss(time_window, connection_name):
         logging.exception(f"Error calculating average packet loss: {e}")
         return 0
 
-# Function to generate packet loss graph for a connection
-def generate_packet_loss_graph(connection_name):
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        one_week_ago = int(time.time()) - (60 * 60 * 24 * 7)  # 1 week ago in UNIX timestamp
-        cursor.execute("""
-            SELECT timestamp, packet_loss FROM traceroute_results
-            WHERE timestamp >= ? AND connection_name = ?
-            ORDER BY timestamp ASC
-        """, (one_week_ago, connection_name))
-        data = cursor.fetchall()
-        conn.close()
-
-        if not data:
-            logging.info(f"No data available for graph generation for {connection_name}")
-            return None
-
-        timestamps, packet_losses = zip(*data)
-        # Filter out negative packet loss values and values above 100%
-        times = []
-        losses = []
-        for ts, pl in zip(timestamps, packet_losses):
-            if 0 <= pl <= 100:
-                times.append(datetime.fromtimestamp(ts))
-                losses.append(pl)
-            else:
-                logging.warning(f"Ignoring out-of-range packet loss value: {pl}% at timestamp {ts}")
-
-        if not times:
-            logging.info(f"No valid data points to plot for {connection_name}")
-            return None
-
-        # Plot the data
-        plt.figure(figsize=(10, 5))
-        plt.plot(times, losses, marker='o', linestyle='-', label=connection_name)
-        plt.xlabel('Time')
-        plt.ylabel('Packet Loss (%)')
-        plt.title(f'Packet Loss Over Time for {connection_name}')
-        plt.legend()
-        plt.grid(True)
-        plt.ylim(0, 100)  # Set Y-axis range from 0% to 100%
-        plt.tight_layout()
-
-        # Save the plot to a BytesIO object
-        img_buffer = BytesIO()
-        plt.savefig(img_buffer, format='png')
-        plt.close()
-        img_buffer.seek(0)
-        # Encode the image to base64
-        img_base64 = base64.b64encode(img_buffer.getvalue()).decode('utf-8')
-
-        return img_base64
-
-    except Exception as e:
-        logging.exception(f"Failed to generate packet loss graph for {connection_name}: {e}")
-        return None
-
 # Function to generate HTML content with packet loss averages and graphs
 def generate_html(connection_names):
     try:
-        html_content = f"""
-        <html>
-        <head>
-            <title>Traceroute and Packet Loss Averages</title>
-            <style>
-                table {{ width: 100%; border-collapse: collapse; }}
-                th, td {{ border: 1px solid black; padding: 8px; text-align: center; }}
-                th {{ background-color: #f2f2f2; }}
-                img {{ max-width: 100%; height: auto; }}
-            </style>
-        </head>
-        <body>
-            <h1>Packet Loss Averages and Graphs</h1>
-        """
+        # Collect data for all connections
+        connection_data = {}
+        for connection_name in connection_names:
+            data = get_packet_loss_data(connection_name)
+            if data:
+                timestamps, packet_losses = zip(*data)
+                # Filter out invalid packet loss values
+                times = []
+                losses = []
+                for ts, pl in zip(timestamps, packet_losses):
+                    if 0 <= pl <= 100:
+                        times.append(datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S'))
+                        losses.append(pl)
+                connection_data[connection_name] = {'times': times, 'losses': losses}
+            else:
+                connection_data[connection_name] = {'times': [], 'losses': []}
 
+        # Prepare averages for each connection
+        averages_data = {}
         for connection_name in connection_names:
             averages = {
                 "last_15_min": get_average_packet_loss(15, connection_name),
@@ -228,51 +189,148 @@ def generate_html(connection_names):
                 "last_day": get_average_packet_loss(60 * 24, connection_name),
                 "last_week": get_average_packet_loss(60 * 24 * 7, connection_name)
             }
+            averages_data[connection_name] = averages
 
-            # Generate packet loss graph
-            img_base64 = generate_packet_loss_graph(connection_name)
-            if img_base64:
-                img_tag = f'<img src="data:image/png;base64,{img_base64}" alt="Packet Loss Graph for {connection_name}">'
-            else:
-                img_tag = '<p>No data available to generate graph.</p>'
+        # Prepare the HTML content
+        html_content = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Packet Loss Monitoring</title>
+            <!-- Include Chart.js from CDN -->
+            <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+            <!-- Include modern CSS framework (Bootstrap) -->
+            <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css">
+            <style>
+                body {{
+                    background-color: #f8f9fa;
+                    padding: 20px;
+                }}
+                h1 {{
+                    margin-bottom: 30px;
+                }}
+                .card {{
+                    margin-bottom: 30px;
+                }}
+                .table td, .table th {{
+                    vertical-align: middle;
+                }}
+                .chart-container {{
+                    position: relative;
+                    height: 400px;
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1 class="text-center">Packet Loss Monitoring</h1>
+        """
+
+        # Add content for each connection
+        for connection_name in connection_names:
+            averages = averages_data[connection_name]
+            times = connection_data[connection_name]['times']
+            losses = connection_data[connection_name]['losses']
+
+            # JSON encode the data for JavaScript
+            times_json = json.dumps(times)
+            losses_json = json.dumps(losses)
 
             html_content += f"""
-            <h2>{connection_name}</h2>
-            <table>
-                <tr>
-                    <th>Time Period</th>
-                    <th>Average Packet Loss (%)</th>
-                </tr>
-                <tr>
-                    <td>Last 15 minutes</td>
-                    <td>{averages['last_15_min']:.2f}</td>
-                </tr>
-                <tr>
-                    <td>Last 30 minutes</td>
-                    <td>{averages['last_30_min']:.2f}</td>
-                </tr>
-                <tr>
-                    <td>Last hour</td>
-                    <td>{averages['last_hour']:.2f}</td>
-                </tr>
-                <tr>
-                    <td>Last day</td>
-                    <td>{averages['last_day']:.2f}</td>
-                </tr>
-                <tr>
-                    <td>Last week</td>
-                    <td>{averages['last_week']:.2f}</td>
-                </tr>
-            </table>
-            <h3>Packet Loss Over Time</h3>
-            {img_tag}
+            <div class="card">
+                <div class="card-header">
+                    <h2>{connection_name}</h2>
+                </div>
+                <div class="card-body">
+                    <div class="row">
+                        <div class="col-md-6">
+                            <h3>Average Packet Loss</h3>
+                            <table class="table table-striped">
+                                <thead>
+                                    <tr>
+                                        <th>Time Period</th>
+                                        <th>Average Packet Loss (%)</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <tr>
+                                        <td>Last 15 minutes</td>
+                                        <td>{averages['last_15_min']:.2f}</td>
+                                    </tr>
+                                    <tr>
+                                        <td>Last 30 minutes</td>
+                                        <td>{averages['last_30_min']:.2f}</td>
+                                    </tr>
+                                    <tr>
+                                        <td>Last hour</td>
+                                        <td>{averages['last_hour']:.2f}</td>
+                                    </tr>
+                                    <tr>
+                                        <td>Last day</td>
+                                        <td>{averages['last_day']:.2f}</td>
+                                    </tr>
+                                    <tr>
+                                        <td>Last week</td>
+                                        <td>{averages['last_week']:.2f}</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                        <div class="col-md-6">
+                            <h3>Packet Loss Over Time</h3>
+                            <div class="chart-container">
+                                <canvas id="chart_{connection_name}"></canvas>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <!-- JavaScript to render the chart -->
+            <script>
+                const ctx_{connection_name} = document.getElementById('chart_{connection_name}').getContext('2d');
+                const chart_{connection_name} = new Chart(ctx_{connection_name}, {{
+                    type: 'line',
+                    data: {{
+                        labels: {times_json},
+                        datasets: [{{
+                            label: '{connection_name} Packet Loss (%)',
+                            data: {losses_json},
+                            borderColor: 'rgba(75, 192, 192, 1)',
+                            backgroundColor: 'rgba(75, 192, 192, 0.2)',
+                            fill: true,
+                            tension: 0.1,
+                        }}]
+                    }},
+                    options: {{
+                        responsive: true,
+                        scales: {{
+                            y: {{
+                                beginAtZero: true,
+                                max: 100,
+                                title: {{
+                                    display: true,
+                                    text: 'Packet Loss (%)'
+                                }}
+                            }},
+                            x: {{
+                                display: true,
+                                title: {{
+                                    display: true,
+                                    text: 'Time'
+                                }}
+                            }}
+                        }}
+                    }}
+                }});
+            </script>
             """
 
         # Add the legal disclaimer at the bottom
         html_content += """
-            <p><em>
-            Disclaimer: This site, <strong>zentrostatus.com</strong>, is an independent, third-party resource created to track internet connectivity and packet loss statistics for personal and educational purposes. It is not affiliated with or endorsed by <strong>Zentro</strong> or any related company. All data provided on this site is collected through public and legal methods, and the results displayed are intended solely for informational purposes. Results are isolated to one point in the network and are not representative of network performance as a whole. This site does not claim to represent the official status or performance of Zentro's services.
-            </em></p>
+                <p class="text-muted"><em>
+                Disclaimer: This site, <strong>zentrostatus.com</strong>, is an independent, third-party resource created to track internet connectivity and packet loss statistics for personal and educational purposes. It is not affiliated with or endorsed by <strong>Zentro</strong> or any related company. All data provided on this site is collected through public and legal methods, and the results displayed are intended solely for informational purposes. Results are isolated to one point in the network and are not representative of network performance as a whole. This site does not claim to represent the official status or performance of Zentro's services.
+                </em></p>
+            </div>
         </body>
         </html>
         """
@@ -300,6 +358,21 @@ if __name__ == "__main__":
 
     logging.info("Starting traceroute monitoring script")
     logging.info(f"Target IP: {target_ip}, Interfaces: {interfaces}")
+
+    # Ensure the database and table exist
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS traceroute_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp INTEGER,
+            connection_name TEXT,
+            target_ip TEXT,
+            packet_loss REAL
+        )
+    """)
+    conn.commit()
+    conn.close()
 
     # Run traceroutes every second for both interfaces
     while True:
