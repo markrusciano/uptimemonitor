@@ -88,7 +88,7 @@ def run_traceroute(ip_address, connection_name, interface, verbose=False):
         return None, None
 
 # Function to save results to SQLite database
-def save_to_db(connection_name, target_ip, packet_loss):
+def save_to_db(connection_name, target_ip, packet_loss, timestamp):
     if packet_loss is None:
         logging.warning(f"No packet loss data to save for {connection_name} targeting {target_ip}")
         return
@@ -96,7 +96,6 @@ def save_to_db(connection_name, target_ip, packet_loss):
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        timestamp = int(time.time())
         cursor.execute(
             "INSERT INTO traceroute_results (timestamp, connection_name, target_ip, packet_loss) VALUES (?, ?, ?, ?)",
             (timestamp, connection_name, target_ip, packet_loss)
@@ -410,12 +409,13 @@ if __name__ == "__main__":
 
     # Run traceroutes every second for both interfaces
     while True:
+        timestamp = int(time.time())
         for i in range(2):  # Run for both interfaces
             interface = interfaces[i]
             connection_name = connection_names[i]
 
             packet_loss, mtr_output = run_traceroute(target_ip, connection_name, interface, verbose=verbose)
-            save_to_db(connection_name, target_ip, packet_loss)
+            save_to_db(connection_name, target_ip, packet_loss, timestamp)
         
         # Generate the HTML file after every traceroute run
         generate_html(connection_names)
